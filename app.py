@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify
 import os, tempfile, requests
 from werkzeug.utils import secure_filename
 from YOLO_basics import predict_video, predict_image
-from datetime import datetime, timezone
 
 app = Flask(__name__)
 
@@ -10,11 +9,12 @@ app = Flask(__name__)
 def index():
     return "✅ RapidWarn YOLO API is running."
 
+# ─────────────────────────────────────────────────────────────────────────────
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    data      = request.get_json(force=True)
+    data = request.get_json(force=True)
     media_url = data.get('url')
-    latitude  = data.get('latitude')
+    latitude = data.get('latitude')
     longitude = data.get('longitude')
 
     if not media_url:
@@ -23,16 +23,26 @@ def analyze():
         return jsonify({"error": "Missing 'latitude' or 'longitude'"}), 400
 
     try:
-        # download to temp
+        # Download from URL
         resp = requests.get(media_url, stream=True)
         resp.raise_for_status()
-        suffix = os.path.splitext(media_url)[1].lower() or ".mp4"
+
+        # Infer content type if no extension
+        content_type = resp.headers.get('Content-Type', '')
+        if '.mp4' in media_url or 'video' in content_type:
+            suffix = ".mp4"
+        elif any(x in media_url for x in ['.jpg', '.jpeg', '.png', '.webp']) or 'image' in content_type:
+            suffix = ".jpg"
+        else:
+            suffix = ".mp4"  # Fallback
+
+        # Save to temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             for chunk in resp.iter_content(8192):
                 tmp.write(chunk)
             local_path = tmp.name
 
-        # dispatch
+        # Dispatch to model
         if suffix in (".jpg", ".jpeg", ".png", ".webp"):
             result = predict_image(
                 input_path=local_path,
@@ -48,10 +58,10 @@ def analyze():
             )
 
         return jsonify({
-            "result":   "processed",
-            "media":    media_url,
+            "result": "processed",
+            "media": media_url,
             "location": {"latitude": latitude, "longitude": longitude},
-            "insight":  result
+            "insight": result
         })
 
     except requests.HTTPError as he:
@@ -60,36 +70,42 @@ def analyze():
         app.logger.error(f"Server error: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-# ── NEW UPLOAD ENDPOINT ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 @app.route('/upload', methods=['POST'])
 def upload_and_analyze():
     file = request.files.get('file')
     if not file or file.filename == '':
         return jsonify({"error": "No file uploaded"}), 400
 
-    # save to temp
+    # Save file
     filename = secure_filename(file.filename)
     tmp_path = os.path.join(tempfile.gettempdir(), filename)
     file.save(tmp_path)
 
-    # optional GPS
+    # Get optional GPS
     lat = request.form.get('latitude', type=float)
     lon = request.form.get('longitude', type=float)
 
-    # run prediction
-    result = predict_video(
-        input_source=tmp_path,
-        output_path="output.mp4",
-        latitude=lat,
-        longitude=lon
-    )
+    # Decide if image or video
+    if filename.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+        result = predict_image(
+            input_path=tmp_path,
+            latitude=lat,
+            longitude=lon
+        )
+    else:
+        result = predict_video(
+            input_source=tmp_path,
+            output_path="output.mp4",
+            latitude=lat,
+            longitude=lon
+        )
 
     return jsonify({
-        "status":  "processed",
+        "status": "processed",
         "insight": result
     })
 
-
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
