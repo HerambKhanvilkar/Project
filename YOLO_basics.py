@@ -1,93 +1,71 @@
-# YOLO_basics.py
-import os, tempfile, requests, cv2
+import os
+import tempfile
+import requests
+import cv2
 from ultralytics import YOLO
 from datetime import datetime, timezone
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────────
+# ─── YOUR SUPABASE CONFIG ──────────────────────────────────────────────────────
 SUPABASE_URL = "https://qnttrmrwrenlsnpwcrkl.supabase.co"
-SUPABASE_KEY = "YOUR_SERVICE_ROLE_KEY"   # ← replace with the service role key from API Keys
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFudHRybXJ3cmVubHNucHdjcmtsIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzI1NTk4OCwiZXhwIjoyMDY4ODMxOTg4fQ.d20cXxyVbdmgO1F4Dvm4B2UTsJCWD37bReL9C-l1J0k"
 
-# load once
+# ─── LOAD MODEL ONCE ───────────────────────────────────────────────────────────
 MODEL = YOLO("yolov8n.pt")
 
-# COCO IDs
+# ─── COCO CLASS IDS ────────────────────────────────────────────────────────────
 PERSON_CLASS = 0
 CAR_CLASS    = 2
-FIRE_CLASS   = 43   # adjust if you have a custom fire class
+FIRE_CLASS   = 43  # adjust if you have a custom fire/smoke class
 
-# ─── HELPERS ────────────────────────────────────────────────────────────────────
+# ─── HELPERS ───────────────────────────────────────────────────────────────────
 def download_file(url: str) -> str:
-    resp = requests.get(url, stream=True)
-    resp.raise_for_status()
-    suffix = os.path.splitext(url)[1] or ".mp4"
-    fd, path = tempfile.mkstemp(suffix=suffix)
+    """Stream-download URL to a temp file, return local path."""
+    r = requests.get(url, stream=True, timeout=10)
+    r.raise_for_status()
+    ext = os.path.splitext(url)[1] or ".mp4"
+    fd, path = tempfile.mkstemp(suffix=ext)
     os.close(fd)
     with open(path, "wb") as f:
-        for chunk in resp.iter_content(8192):
+        for chunk in r.iter_content(8192):
             f.write(chunk)
     return path
 
-def sharpen_frame(frame):
-    blur = cv2.GaussianBlur(frame, (0,0), sigmaX=3, sigmaY=3)
-    return cv2.addWeighted(frame, 1.5, blur, -0.5, 0)
-
-def _insert_insight(insight: dict):
-    url = f"{SUPABASE_URL}/rest/v1/insights"
+def push_insight(insight: dict):
+    """Insert one row into supabase insights via REST."""
+    endpoint = f"{SUPABASE_URL}/rest/v1/insights"
     headers = {
         "apikey":        SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type":  "application/json",
         "Prefer":        "return=representation"
     }
-    r = requests.post(url, headers=headers, json=insight)
+    r = requests.post(endpoint, headers=headers, json=insight, timeout=10)
     r.raise_for_status()
     return r.json()
 
-# ─── MAIN ───────────────────────────────────────────────────────────────────────
-def predict_video(
-    input_source: str,
-    latitude: float = None,
-    longitude: float = None,
-    threshold: int = 30,
-    conf_thresh: float = 0.1,
-    img_size: int = 320
-) -> dict:
-    # get local file
-    path = download_file(input_source) if input_source.lower().startswith("http") else input_source
+# ─── CORE PREDICT (FIRST FRAME) ────────────────────────────────────────────────
+def analyze_frame(frame, latitude, longitude):
+    # resize & mild sharpen
+    small = cv2.resize(frame, (320, 320))
+    blur  = cv2.GaussianBlur(small, (0,0), sigmaX=2, sigmaY=2)
+    inp   = cv2.addWeighted(small, 1.3, blur, -0.3, 0)
 
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        return {"error": f"Cannot open video {path}"}
+    # run YOLO
+    results = MODEL(inp, conf=0.1, iou=0.45, augment=False)
 
-    # read only the first frame
-    ret, frame = cap.read()
-    cap.release()
-    if not ret:
-        return {"error": "Failed to read first frame"}
+    # counts
+    pts = sum(int(b.cls)==PERSON_CLASS for r in results for b in r.boxes)
+    cts = sum(int(b.cls)==CAR_CLASS    for r in results for b in r.boxes)
+    fts = sum(int(b.cls)==FIRE_CLASS   for r in results for b in r.boxes)
 
-    # preprocess
-    small = cv2.resize(frame, (img_size, img_size))
-    sharp = sharpen_frame(small)
+    # classify
+    if pts > 40:       dtype = "stampede"
+    elif fts > 0:      dtype = "riot"
+    elif cts > 0:      dtype = "accident"
+    else:              dtype = "unknown"
 
-    # inference
-    results = MODEL(sharp, conf=conf_thresh, iou=0.45, augment=False)
+    status = "SAFE" if pts <= 30 else "UNSAFE"
 
-    # count detections
-    persons = sum(int(box.cls)==PERSON_CLASS for res in results for box in res.boxes)
-    cars    = sum(int(box.cls)==CAR_CLASS    for res in results for box in res.boxes)
-    fires   = sum(int(box.cls)==FIRE_CLASS   for res in results for box in res.boxes)
-
-    # decide disaster
-    if persons > 40:
-        dtype = "stampede"
-    elif fires > 0:
-        dtype = "riot"
-    elif cars > 0:
-        dtype = "accident"
-    else:
-        dtype = "unknown"
-
-    status = "SAFE" if persons <= threshold else "UNSAFE"
     insight = {
         "type":       dtype,
         "location":   None,
@@ -96,16 +74,39 @@ def predict_video(
         "status":     status,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
-
-    try:
-        _insert_insight(insight)
-    except Exception as e:
-        print("Supabase insert failed:", e)
+    push_insight(insight)
 
     return {
         "disaster_type": dtype,
-        "person_count":  persons,
-        "car_count":     cars,
-        "fire_count":    fires,
+        "person_count":  pts,
+        "car_count":     cts,
+        "fire_count":    fts,
         "status":        status
     }
+
+# ─── PUBLIC ENTRYPOINT ─────────────────────────────────────────────────────────
+def predict_media(input_url: str, latitude: float, longitude: float) -> dict:
+    """
+    Download (if URL), then read first frame of image or video,
+    analyze, push to Supabase, and return the counts + classification.
+    """
+    # if it’s a URL, download to temp
+    local = download_file(input_url) if input_url.lower().startswith("http") else input_url
+
+    # choose whether image or video by extension
+    ext = os.path.splitext(local)[1].lower()
+    if ext in (".jpg", ".jpeg", ".png", ".webp"):
+        frame = cv2.imread(local)
+        if frame is None:
+            raise RuntimeError(f"Cannot read image {local}")
+        return analyze_frame(frame, latitude, longitude)
+
+    # else treat as video: open, read one frame
+    cap = cv2.VideoCapture(local)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video {local}")
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise RuntimeError("Failed to grab first frame from video")
+    return analyze_frame(frame, latitude, longitude)

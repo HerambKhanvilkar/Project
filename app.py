@@ -1,14 +1,12 @@
-# app.py
-import traceback
 from flask import Flask, request, jsonify
-import requests, tempfile, os
-from YOLO_basics import predict_video
+import requests, os
+from YOLO_basics import predict_media
 
 app = Flask(__name__)
 
 @app.route('/')
-def index():
-    return "✅ RapidWarn YOLO API is running."
+def home():
+    return "✅ RapidWarn YOLO API is up"
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
@@ -17,23 +15,29 @@ def analyze():
     lat  = data.get('latitude')
     lon  = data.get('longitude')
 
+    # 1) validate
     if not url:
         return jsonify({"error": "Missing 'url'"}), 400
     if lat is None or lon is None:
         return jsonify({"error": "Missing 'latitude' or 'longitude'"}), 400
 
+    # 2) quick HEAD to ensure it’s media
     try:
-        # simply call our helper
-        result = predict_video(input_source=url, latitude=lat, longitude=lon)
-        return jsonify({"result": "processed", "insight": result})
+        h = requests.head(url, timeout=5)
+        c = h.headers.get("Content-Type","")
+        if h.status_code!=200 or ("text/html" in c):
+            return jsonify({"error": "URL not pointing to an image/video"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Cannot reach URL: {e}"}), 400
 
-    except requests.HTTPError as he:
-        return jsonify({"error": f"Download failed: {he}"}), 502
+    # 3) run your model
+    try:
+        insight = predict_media(url, lat, lon)
+        return jsonify({"result":"processed", "insight":insight})
+    except Exception as e:
+        app.logger.error(str(e))
+        return jsonify({"error":"Internal server error"}), 500
 
-    except Exception:
-        tb = traceback.format_exc()
-        app.logger.error(f"Internal error:\n{tb}")
-        return jsonify({"error": "Internal server error"}), 500
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
