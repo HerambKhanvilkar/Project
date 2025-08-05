@@ -1,27 +1,21 @@
-import os
-import tempfile
-import requests
-import cv2
-from datetime import datetime, timezone
+import os, tempfile, requests, cv2
 from ultralytics import YOLO
+from datetime import datetime, timezone
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────────
 SUPABASE_URL = "https://qnttrmrwrenlsnpwcrkl.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFudHRybXJ3cmVubHNucHdjcmtsIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzI1NTk4OCwiZXhwIjoyMDY4ODMxOTg4fQ.d20cXxyVbdmgO1F4Dvm4B2UTsJCWD37bReL9C-l1J0k"
 
-# Load YOLOv8n model
 MODEL = YOLO("yolov8n.pt")
 
-# COCO class IDs
 PERSON_CLASS = 0
-CAR_CLASS    = 2
-FIRE_CLASS   = 43  # adjust if using custom dataset
+CAR_CLASS = 2
+FIRE_CLASS = 43  # Adjust if your custom model uses different class id
 
-# ─── HELPERS ────────────────────────────────────────────────────────────────────
 def download_file(url: str) -> str:
     resp = requests.get(url, stream=True)
     resp.raise_for_status()
-    suffix = os.path.splitext(url)[1] or ".mp4"
+    ext = os.path.splitext(url)[-1]
+    suffix = ext if ext else ".mp4"
     fd, path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     with open(path, "wb") as f:
@@ -29,82 +23,69 @@ def download_file(url: str) -> str:
             f.write(chunk)
     return path
 
-def extract_first_frame(path: str):
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise ValueError("Cannot open video")
-    ret, frame = cap.read()
-    cap.release()
-    if not ret:
-        raise ValueError("Failed to read first frame")
-    return frame
-
-def preprocess_frame(frame, img_size=320):
-    resized = cv2.resize(frame, (img_size, img_size))
-    blur = cv2.GaussianBlur(resized, (0,0), sigmaX=3, sigmaY=3)
-    sharpened = cv2.addWeighted(resized, 1.5, blur, -0.5, 0)
-    return sharpened
+def sharpen_frame(frame):
+    blur = cv2.GaussianBlur(frame, (0,0), sigmaX=3, sigmaY=3)
+    return cv2.addWeighted(frame, 1.5, blur, -0.5, 0)
 
 def _insert_insight(insight: dict):
     url = f"{SUPABASE_URL}/rest/v1/insights"
     headers = {
-        "apikey":        SUPABASE_KEY,
+        "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type":  "application/json",
-        "Prefer":        "return=representation"
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
     }
     r = requests.post(url, headers=headers, json=insight)
     r.raise_for_status()
     return r.json()
 
-# ─── MAIN LOGIC ─────────────────────────────────────────────────────────────────
-def analyze_frame(frame, latitude, longitude):
-    inp = preprocess_frame(frame)
-    print("🔍 Running model...")
-    results = MODEL(inp, conf=0.1, iou=0.45, augment=False)
+def analyze_frame(frame, latitude, longitude, threshold=30):
+    inp = cv2.resize(frame, (320, 320))
+    sharp = sharpen_frame(inp)
+    results = MODEL(sharp, conf=0.1, iou=0.45)
 
-    persons = sum(int(box.cls)==PERSON_CLASS for res in results for box in res.boxes)
-    cars    = sum(int(box.cls)==CAR_CLASS    for res in results for box in res.boxes)
-    fires   = sum(int(box.cls)==FIRE_CLASS   for res in results for box in res.boxes)
+    persons = sum(int(box.cls) == PERSON_CLASS for res in results for box in res.boxes)
+    cars = sum(int(box.cls) == CAR_CLASS for res in results for box in res.boxes)
+    fires = sum(int(box.cls) == FIRE_CLASS for res in results for box in res.boxes)
 
-    if persons > 40:
-        dtype = "stampede"
-    elif fires > 0:
-        dtype = "riot"
-    elif cars > 0:
-        dtype = "accident"
-    else:
-        dtype = "unknown"
+    dtype = "stampede" if persons > 40 else "riot" if fires > 0 else "accident" if cars > 0 else "unknown"
+    status = "SAFE" if persons <= threshold else "UNSAFE"
 
-    status = "SAFE" if persons <= 30 else "UNSAFE"
     insight = {
-        "type":       dtype,
-        "location":   None,
-        "latitude":   latitude,
-        "longitude":  longitude,
-        "status":     status,
+        "type": dtype,
+        "location": None,
+        "latitude": latitude,
+        "longitude": longitude,
+        "status": status,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
 
     try:
         _insert_insight(insight)
     except Exception as e:
-        print("Supabase insert failed:", e)
+        print("Insert failed:", e)
 
     return {
         "disaster_type": dtype,
-        "person_count":  persons,
-        "car_count":     cars,
-        "fire_count":    fires,
-        "status":        status
+        "person_count": persons,
+        "car_count": cars,
+        "fire_count": fires,
+        "status": status
     }
 
 def predict_media(input_source: str, latitude: float, longitude: float):
-    print(f"📥 Downloading from {input_source}")
     path = download_file(input_source)
-    print(f"✅ File saved to {path}")
+    if path.lower().endswith((".jpg", ".jpeg", ".png")):
+        image = cv2.imread(path)
+        return analyze_frame(image, latitude, longitude)
+    else:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            return {"error": f"Can't open video {path}"}
 
-    frame = extract_first_frame(path)
-    print(f"🖼 Frame size: {frame.shape}")
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            return {"error": "Can't read frame from video"}
 
-    return analyze_frame(frame, latitude, longitude)
+        return analyze_frame(frame, latitude, longitude)

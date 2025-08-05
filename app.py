@@ -5,29 +5,27 @@ from YOLO_basics import predict_media
 app = Flask(__name__)
 
 @app.route('/')
-def index():
-    return "✅ RapidWarn YOLO API is running."
+def home():
+    return "✅ YOLO Disaster Detection API is running."
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
+    data = request.get_json(force=True)
+    url = data.get("url")
+    lat = data.get("latitude")
+    lon = data.get("longitude")
+
+    if not url or lat is None or lon is None:
+        return jsonify({"error": "Missing required fields"}), 400
+
     try:
-        data = request.get_json(force=True)
-        url = data.get('url')
-        lat = data.get('latitude')
-        lon = data.get('longitude')
+        insight = predict_media(url, lat, lon)
+        return jsonify({"status": "processed", "insight": insight})
+    except Exception:
+        tb = traceback.format_exc()
+        app.logger.error(tb)
+        return jsonify({"error": "Internal Server Error"}), 500
 
-        if not url:
-            return jsonify({"error": "Missing 'url'"}), 400
-        if lat is None or lon is None:
-            return jsonify({"error": "Missing 'latitude' or 'longitude'"}), 400
-
-        print(f"▶️ Received: {url}, lat: {lat}, lon: {lon}")
-        result = predict_media(url, lat, lon)
-        return jsonify({"result": "processed", "insight": result})
-
-    except Exception as e:
-        print("❌ ERROR in /analyze:\n", traceback.format_exc())  # Log full error
-        return jsonify({"error": "Internal server error"}), 500
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    import os
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
