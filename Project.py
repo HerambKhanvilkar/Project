@@ -5,5 +5,7 @@ payload = {
   "latitude": 19.0760,
   "longitude": 72.8777
 }
-r = requests.post("https://project-vlo5.onrender.com", json=payload, timeout=30)
-print(r.status_code, r.json())
+
+r = requests.post("https://project-vlo5.onrender.com/analyze", json=payload, timeout=60)
+print("Status Code:", r.status_code)
+print("Response:", r.text)
