@@ -1,6 +1,7 @@
 import os, tempfile, requests, cv2
 from ultralytics import YOLO
 from datetime import datetime, timezone
+import psutil
 
 SUPABASE_URL = "https://qnttrmrwrenlsnpwcrkl.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFudHRybXJ3cmVubHNucHdjcmtsIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MzI1NTk4OCwiZXhwIjoyMDY4ODMxOTg4fQ.d20cXxyVbdmgO1F4Dvm4B2UTsJCWD37bReL9C-l1J0k"
@@ -40,9 +41,18 @@ def _insert_insight(insight: dict):
     return r.json()
 
 def analyze_frame(frame, latitude, longitude, threshold=30):
+    # ✅ RAM Usage Before Processing
+    process = psutil.Process(os.getpid())
+    print("📦 RAM Before Processing (MB):", process.memory_info().rss / 1024 / 1024)
+
     inp = cv2.resize(frame, (320, 320))
     sharp = sharpen_frame(inp)
+
+    # ✅ RAM Usage Before YOLO Inference
+    print("⚙️ RAM Before Inference (MB):", process.memory_info().rss / 1024 / 1024)
     results = MODEL(sharp, conf=0.1, iou=0.45)
+    # ✅ RAM Usage After Inference
+    print("✅ RAM After Inference (MB):", process.memory_info().rss / 1024 / 1024)
 
     persons = sum(int(box.cls) == PERSON_CLASS for res in results for box in res.boxes)
     cars = sum(int(box.cls) == CAR_CLASS for res in results for box in res.boxes)
