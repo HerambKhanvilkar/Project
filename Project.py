@@ -6,7 +6,7 @@ payload = {
     "longitude": 72.8777
 }
 
-r = requests.post("https://your-api-name.onrender.com/analyze", json=payload)
+r = requests.post("https://project-vlo5.onrender.com/analyze", json=payload)
 print("Status Code:", r.status_code)
 try:
     print("Response:", r.json())
