@@ -1,31 +1,39 @@
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, Request, HTTPException
+from YOLO_basics import analyze_media
+import uvicorn
 import traceback
-from YOLO_basics import predict_media
 
-app = Flask(__name__)
+app = FastAPI(title="YOLO Disaster Detection Webhook")
 
-@app.route('/')
-def home():
-    return "✅ YOLO Disaster Detection API is running."
+@app.get("/")
+async def root():
+    return {"status": "✅ Webhook is running"}
 
-@app.route('/analyze', methods=['POST'])
-def analyze():
-    data = request.get_json(force=True)
-    url = data.get("url")
-    lat = data.get("latitude")
-    lon = data.get("longitude")
-
-    if not url or lat is None or lon is None:
-        return jsonify({"error": "Missing required fields"}), 400
-
+@app.post("/process")
+async def process(request: Request):
     try:
-        insight = predict_media(url, lat, lon)
-        return jsonify({"status": "processed", "insight": insight})
-    except Exception:
-        tb = traceback.format_exc()
-        app.logger.error(tb)
-        return jsonify({"error": "Internal Server Error"}), 500
+        data = await request.json()
+        record = data.get("record", {})
+        file_name = record.get("name")
+        bucket_id = record.get("bucket_id")
+
+        print("📦 Incoming webhook for:", file_name, "in bucket:", bucket_id)
+
+        if not file_name or not bucket_id:
+            raise HTTPException(status_code=400, detail="Invalid webhook payload")
+
+        insight = analyze_media(bucket_id, file_name)
+        return {
+            "status": "processed",
+            "file_name": file_name,
+            "bucket_id": bucket_id,
+            "insight": insight
+        }
+
+    except Exception as e:
+        print("❌ ERROR in /process:", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
 
 if __name__ == "__main__":
-    import os
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
