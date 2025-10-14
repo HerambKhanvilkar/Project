@@ -13,47 +13,18 @@ TABLE_NAME = "insights"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Load models
-base_model = YOLO("yolov8n.pt")  # For person, vehicle, and gun detection
-fire_smoke_model = YOLO("models/fire_smoke.pt")  # Detects fire and smoke
-accident_model = YOLO("models/accident.pt")  # Detects accident-specific signals
+accident_model = YOLO("models/accident.pt")
+stampede_model = YOLO("models/stampede.pt")
+fire_model     = YOLO("models/fire_smoke.pt")
 
-def process_frame(frame):
-    persons, cars = 0, 0
-    fire_count = smoke_count = gun_count = accident_count = 0
+def get_confidence(model, frame, conf=0.3, iou=0.5):
+    """Run YOLO model and return max confidence score."""
+    results = model(frame, conf=conf, iou=iou, verbose=False)
+    if results and results[0].boxes:
+        return float(results[0].boxes.conf.max().cpu().numpy())
+    return 0.0
 
-    # Base model
-    base_results = base_model(frame, conf=0.25, iou=0.5, verbose=False)
-    for result in base_results:
-        for box in result.boxes:
-            label = base_model.names[int(box.cls.item())]
-            if label == "person":
-                persons += 1
-            elif label in {"car", "truck", "bus"}:
-                cars += 1
-            elif label == "gun":
-                gun_count += 1
-
-    # Fire/Smoke model
-    fire_smoke_results = fire_smoke_model(frame, conf=0.3, iou=0.5, verbose=False)
-    for result in fire_smoke_results:
-        for box in result.boxes:
-            label = fire_smoke_model.names[int(box.cls.item())]
-            if label == "fire":
-                fire_count += 1
-            elif label == "smoke":
-                smoke_count += 1
-
-    # Accident model
-    accident_results = accident_model(frame, conf=0.3, iou=0.5, verbose=False)
-    for result in accident_results:
-        for box in result.boxes:
-            label = accident_model.names[int(box.cls.item())]
-            if label == "accident":
-                accident_count += 1
-
-    return persons, cars, fire_count, smoke_count, gun_count, accident_count
-
-def analyze_media(bucket_id: str, file_name: str):
+def analyze_media(bucket_id: str, file_name: str, conf_threshold=0.3):
     try:
         file_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket_id}/{file_name}"
         print("🔍 file_url:", file_url)
@@ -73,84 +44,60 @@ def analyze_media(bucket_id: str, file_name: str):
             tmp.write(chunk)
         tmp.close()
 
-        # Process with YOLO
-        cap = cv2.VideoCapture(tmp.name)
-        is_video = cap.isOpened() and int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) > 1
-        max_persons = max_cars = max_fire = max_smoke = max_gun = max_accident = 0
-        frame_count, sample_rate = 0, 5
+        # Read frame (image only for simplicity; extend to video if needed)
+        frame = cv2.imread(tmp.name)
+        if frame is None:
+            raise ValueError("Failed to read image file.")
 
-        if is_video:
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frame_count += 1
-                if frame_count % sample_rate:
-                    continue
-                persons, cars, fire, smoke, gun, accident = process_frame(frame)
-                max_persons = max(max_persons, persons)
-                max_cars = max(max_cars, cars)
-                max_fire = max(max_fire, fire)
-                max_smoke = max(max_smoke, smoke)
-                max_gun = max(max_gun, gun)
-                max_accident = max(max_accident, accident)
-            cap.release()
-        else:
-            frame = cv2.imread(tmp.name)
-            if frame is None:
-                raise ValueError("Failed to read image file.")
-            persons, cars, fire, smoke, gun, accident = process_frame(frame)
-            max_persons, max_cars, max_fire, max_smoke, max_gun, max_accident = persons, cars, fire, smoke, gun, accident
+        # Get confidences
+        acc_conf   = get_confidence(accident_model, frame, conf=conf_threshold)
+        stamp_conf = get_confidence(stampede_model, frame, conf=conf_threshold)
+        fire_conf  = get_confidence(fire_model, frame, conf=conf_threshold)
 
-        # Release file handle
-        try:
-            os.remove(tmp.name)
-        except PermissionError:
-            print("⚠️ Could not delete temp file immediately. Will retry...")
-            time.sleep(1)
-            try:
-                os.remove(tmp.name)
-            except Exception as e:
-                print("❌ Still couldn't delete temp file:", e)
-
-        # Classification + description + intensity
-        disaster_type = "unknown"
-        description = None
-        intensity = None
-
-        if max_persons >= 10 and max_cars == 0 and max_fire == 0 and max_smoke == 0 and max_gun == 0:
-            disaster_type = "stampede"
-            description = (
-                f"A large crowd of approximately {max_persons} people detected , "
-                "with no vehicles or other disaster signals present — possible stampede risk."
-            )
-        elif max_cars >= 1 and max_accident >= 1:
+        # Classification + description
+        if acc_conf >= conf_threshold and acc_conf > stamp_conf and acc_conf > fire_conf:
             disaster_type = "accident"
             description = (
-                f"A road accident scenario , involving {max_cars} vehicle(s) "
-                f"and {max_accident} accident signal(s) detected."
-            )
-        elif max_persons >= 5 and (max_fire + max_smoke + max_gun) >= 1:
-            disaster_type = "riot"
-            description = (
-                f"A scene showing signs of civil unrest , "
-                f"with {max_persons} people present, {max_fire} fire source(s), "
-                f"{max_smoke} smoke plume(s), and {max_gun} possible weapon(s) detected."
+                "The scene shows strong signs of a road accident, "
+                "with clear indicators of a collision or crash."
             )
 
-        # Intensity only if disaster detected
-        if disaster_type != "unknown":
-            raw_score = (
-                2 * max_fire +
-                2 * max_smoke +
-                3 * max_gun +
-                1 * max_persons +
-                2 * max_accident
+        elif stamp_conf >= conf_threshold and stamp_conf > acc_conf and stamp_conf > fire_conf:
+            disaster_type = "stampede"
+            description = (
+                "The scene suggests a potential stampede, "
+                "with dense crowd movement dominating the environment."
             )
-            if raw_score >= 7:
+
+        elif fire_conf >= conf_threshold and fire_conf > acc_conf and fire_conf > stamp_conf:
+            disaster_type = "fire"
+            description = (
+                "The scene indicates a fire‑related disaster, "
+                "with visible flames or smoke being the dominant signals."
+            )
+
+        else:
+            disaster_type = "normal"
+            description = (
+                "No strong disaster indicators are present. "
+                "The environment appears stable without clear signs of accident, stampede, or fire."
+            )
+        # Intensity scoring (based on sum of confidences)
+        intensity = None
+        if disaster_type != "normal":
+            raw_score = acc_conf + stamp_conf + fire_conf
+            if raw_score >= 1.5:
                 intensity = "high"
-            elif raw_score >= 4:
+            elif raw_score >= 0.8:
                 intensity = "moderate"
+            else:
+                intensity = "low"
+
+        # Clean up temp file
+        try:
+            os.remove(tmp.name)
+        except Exception:
+            pass
 
         # Update row in Supabase
         supabase.table(TABLE_NAME).update({
@@ -172,8 +119,11 @@ def analyze_media(bucket_id: str, file_name: str):
     except Exception as e:
         print("❌ ERROR in analyze_media:", e)
         traceback.print_exc()
-        supabase.table(TABLE_NAME).update({
-            "processed": False,
-            "disaster_type": "error"
-        }).match({"media_url": file_url}).execute()
+        try:
+            supabase.table(TABLE_NAME).update({
+                "processed": False,
+                "disaster_type": "error"
+            }).match({"media_url": file_url}).execute()
+        except Exception:
+            pass
         return {"error": str(e), "processed": False}
